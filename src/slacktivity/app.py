@@ -112,6 +112,18 @@ class Message:
         return float(self.ts)
 
 
+@dataclass
+class UndoEntry:
+    """One reversible triage action, recorded as the changes it made to `dismissed`."""
+
+    label: str
+    dismissed: list[tuple[str, str]]  # keys this action added to dismissed
+    restored: dict[tuple[str, str], "Message"]  # messages this action removed from dismissed
+
+
+UNDO_LIMIT = 50
+
+
 class SlacktivityApp(App):
     CSS = """
     #status { dock: top; height: 1; padding: 0 1; background: $panel; color: $text; }
@@ -125,13 +137,18 @@ class SlacktivityApp(App):
     """
 
     BINDINGS = [
-        Binding("1", "toggle('1')", "Unread", show=True),
-        Binding("2", "toggle('2')", "Favs", show=True),
-        Binding("3", "toggle('3')", "DM/@", show=True),
+        # Filters (1/2/3) live in the top status bar, so they're hidden from the footer.
+        Binding("1", "toggle('1')", "Unread", show=False),
+        Binding("2", "toggle('2')", "Favs", show=False),
+        Binding("3", "toggle('3')", "DM/@", show=False),
         Binding("r", "mark_read", "Mark read", show=True),
         Binding("a", "mark_all", "Mark all read", show=True),
         Binding("d", "toggle_dismissed", "Read view", show=True),
         Binding("u", "unmark", "Mark unread", show=True),
+        Binding("z", "undo", "Undo", show=True),
+        # Vim-style navigation, mirroring the arrow keys; hidden from the footer.
+        Binding("j", "feed_cursor(1)", show=False),
+        Binding("k", "feed_cursor(-1)", show=False),
         Binding("g", "poll_now", "Refresh", show=True),
         Binding("o", "open_message", "Open in Slack", show=True),
         Binding("q", "quit", "Quit", show=True),
@@ -180,11 +197,13 @@ class SlacktivityApp(App):
         for record in load_dismissed():
             m = self._message_from_record(record)
             self.dismissed[(m.channel, m.ts)] = m
+        self._undo_stack: list[UndoEntry] = []
         self.active: set[str] = {"all_unread"}
         self.show_dismissed = False
         self.visible_order: list[tuple[str, str]] = []
         self._render_sig: tuple | None = None
         self._first_render = True
+        self._bootstrapped = False
         self.status_extra = "starting…"
 
     def compose(self) -> ComposeResult:
@@ -195,23 +214,35 @@ class SlacktivityApp(App):
 
     async def on_mount(self) -> None:
         self.update_status()
-        await self._bootstrap()
-        self.set_interval(POLL_SECONDS, self.poll)
+        # Run setup in a worker so on_mount returns and the UI paints immediately.
+        # Awaiting it here would leave the screen blank until setup finished.
+        self.run_worker(self._bootstrap(), exclusive=True)
 
     # ---- setup ---------------------------------------------------------
 
+    def _set_status(self, text: str) -> None:
+        """Set the trailing status text and repaint, so progress shows between awaits."""
+        self.status_extra = text
+        self.update_status()
+
     async def _bootstrap(self) -> None:
         try:
+            self._set_status("connecting to Slack…")
             auth = await self.session.call("auth.test")
             self.own_id = auth["user_id"]
             self.team_id = auth.get("team_id", "")
+            self._set_status("loading channels…")
             await self._load_channels()
         except (SlackError, httpx.HTTPError) as exc:
-            self.status_extra = f"auth/setup failed: {exc}"
-            self.update_status()
+            self._set_status(f"auth/setup failed: {exc}")
             return
-        await self._load_favorites()
+        self._set_status("loading favorites…")
+        await self._load_favorites()  # leaves the favorites count in status_extra
+        summary = self.status_extra
         await self.poll()
+        self._bootstrapped = True
+        self._set_status(summary)
+        self.set_interval(POLL_SECONDS, self.poll)
 
     async def _load_channels(self) -> None:
         cursor = ""
@@ -298,7 +329,14 @@ class SlacktivityApp(App):
         entries = (
             counts.get("channels", []) + counts.get("mpims", []) + counts.get("ims", [])
         )
+        # On the first poll show progress, since fetching history for each active
+        # channel is the slow part of startup. _sync_channel skips the rest.
+        fetching = [e for e in entries if e.get("has_unreads") or e["id"] in self.favorite_ids]
+        done = 0
         for entry in entries:
+            if not self._bootstrapped and (entry.get("has_unreads") or entry["id"] in self.favorite_ids):
+                done += 1
+                self._set_status(f"fetching messages… ({done}/{len(fetching)})")
             await self._sync_channel(entry)
 
         self._trim()
@@ -490,13 +528,16 @@ class SlacktivityApp(App):
         if self.show_dismissed:
             status.update(
                 f"[b]READ view[/b]   shown: {len(self.visible_order)}   "
-                f"u: mark unread   d: back to feed   {self.status_extra}"
+                f"u: mark unread   z: undo   d: back to feed   {self.status_extra}"
             )
             return
-        labels = [label for _, (fid, label) in FILTERS.items() if fid in self.active]
-        active = ", ".join(labels) if labels else "none"
+        chips = []
+        for key, (fid, label) in FILTERS.items():
+            text = escape(f"{key} {label}")
+            chips.append(f"[reverse] {text} [/reverse]" if fid in self.active else f"[dim]{text}[/dim]")
+        filters = "  ".join(chips)
         status.update(
-            f"filters: [b]{active}[/b]   "
+            f"[b]Filters[/b]  {filters}    "
             f"shown: {len(self.visible_order)}   dismissed: {len(self.dismissed)}   {self.status_extra}"
         )
 
@@ -510,6 +551,14 @@ class SlacktivityApp(App):
             self.active.add(fid)
         self.update_status()  # immediate feedback even if visible rows don't change
         self.refresh_table()
+
+    def action_feed_cursor(self, delta: int) -> None:
+        """Move the feed selection (j/k), mirroring the arrow keys."""
+        feed = self.query_one("#feed", ListView)
+        if delta > 0:
+            feed.action_cursor_down()
+        else:
+            feed.action_cursor_up()
 
     def _selected_key(self) -> tuple[str, str] | None:
         feed = self.query_one("#feed", ListView)
@@ -529,6 +578,7 @@ class SlacktivityApp(App):
             self.notify("No row selected.", severity="warning")
             return
         self.dismissed[key] = m
+        self._push_undo(UndoEntry(f"read {m.channel_name}", dismissed=[key], restored={}))
         self._save_dismissed()
         self.notify(f"Marked {m.channel_name} message read.")
         self.refresh_table()
@@ -540,15 +590,20 @@ class SlacktivityApp(App):
             return
         count = len(self.visible_order)
         if self.show_dismissed:
+            restored = {key: self.dismissed[key] for key in self.visible_order if key in self.dismissed}
             for key in list(self.visible_order):
                 self._restore(key)
+            self._push_undo(UndoEntry(f"unread {count}", dismissed=[], restored=restored))
             self._save_dismissed()
             self.notify(f"Marked {count} messages unread.")
         else:
+            added: list[tuple[str, str]] = []
             for key in self.visible_order:
                 m = self.messages.get(key)
                 if m:
                     self.dismissed[key] = m
+                    added.append(key)
+            self._push_undo(UndoEntry(f"read {count}", dismissed=added, restored={}))
             self._save_dismissed()
             self.notify(f"Marked {count} messages read.")
         self.refresh_table()
@@ -568,7 +623,9 @@ class SlacktivityApp(App):
         if not key or key not in self.dismissed:
             self.notify("No row selected.", severity="warning")
             return
+        m = self.dismissed[key]
         self._restore(key)
+        self._push_undo(UndoEntry(f"unread {m.channel_name}", dismissed=[], restored={key: m}))
         self._save_dismissed()
         self.notify("Marked unread.")
         self.refresh_table()
@@ -578,6 +635,24 @@ class SlacktivityApp(App):
         m = self.dismissed.pop(key, None)
         if m and key not in self.messages:
             self.messages[key] = m
+
+    def _push_undo(self, entry: UndoEntry) -> None:
+        self._undo_stack.append(entry)
+        del self._undo_stack[:-UNDO_LIMIT]
+
+    def action_undo(self) -> None:
+        """Reverse the most recent triage action (mark read / mark unread)."""
+        if not self._undo_stack:
+            self.notify("Nothing to undo.", severity="warning")
+            return
+        entry = self._undo_stack.pop()
+        for key in entry.dismissed:
+            self._restore(key)
+        for key, m in entry.restored.items():
+            self.dismissed[key] = m
+        self._save_dismissed()
+        self.notify(f"Undid: {entry.label}.")
+        self.refresh_table()
 
     async def action_poll_now(self) -> None:
         await self.poll()

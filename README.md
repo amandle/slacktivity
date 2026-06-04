@@ -63,6 +63,7 @@ workspace; file it and the lookup can be pointed at the right field.
 | `a` | mark every visible message read — or, in the read view, mark them all unread |
 | `d` | toggle the **read view** (archive of messages you've marked read) |
 | `u` | in the read view, mark the selected message unread (restore it to the feed) |
+| `z` | undo the last mark-read / mark-unread action |
 | `g` | poll now |
 | `q` | quit |
 | ↑/↓ | move selection |

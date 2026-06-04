@@ -5,13 +5,19 @@ import json
 import re
 import time
 import webbrowser
+from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 
 import httpx
 from rich.markup import escape
 from textual.app import App
 from textual.app import ComposeResult
 from textual.binding import Binding
+from textual.command import DiscoveryHit
+from textual.command import Hit
+from textual.command import Hits
+from textual.command import Provider
 from textual.containers import Horizontal
 from textual.widgets import Footer
 from textual.widgets import Header
@@ -24,6 +30,7 @@ from .client import SlackError
 from .client import SlackSession
 from .config import Config
 from .config import load_dismissed
+from .config import save
 from .config import save_dismissed
 
 POLL_SECONDS = 5
@@ -124,7 +131,44 @@ class UndoEntry:
 UNDO_LIMIT = 50
 
 
+class SettingsCommands(Provider):
+    """Surface slacktivity's settings and views in the command palette (ctrl+p)."""
+
+    def _commands(self) -> list[tuple[str, str, Callable[[], object]]]:
+        app: "SlacktivityApp" = self.app
+        bell_label = "Bell: turn off" if app.bell_enabled else "Bell: turn on"
+        view_label = "View: back to feed" if app.show_dismissed else "View: read archive"
+        commands: list[tuple[str, str, Callable[[], object]]] = [
+            ("Refresh", "Poll Slack for new messages now", app.action_poll_now),
+            (bell_label, "Ring the terminal bell on new messages", app.action_toggle_bell),
+            (view_label, "Toggle the read-archive view", app.action_toggle_dismissed),
+        ]
+        for key, (fid, label) in FILTERS.items():
+            state = "on" if fid in app.active else "off"
+            commands.append(
+                (
+                    f"Filter: {label} ({state})",
+                    "Toggle this feed filter",
+                    partial(app.action_toggle, key),
+                )
+            )
+        return commands
+
+    async def discover(self) -> Hits:
+        for name, help_text, callback in self._commands():
+            yield DiscoveryHit(name, callback, help=help_text)
+
+    async def search(self, query: str) -> Hits:
+        matcher = self.matcher(query)
+        for name, help_text, callback in self._commands():
+            score = matcher.match(name)
+            if score > 0:
+                yield Hit(score, matcher.highlight(name), callback, help=help_text)
+
+
 class SlacktivityApp(App):
+    COMMANDS = App.COMMANDS | {SettingsCommands}
+
     CSS = """
     #status { dock: top; height: 1; padding: 0 1; background: $panel; color: $text; }
     #feed { height: 1fr; }
@@ -149,7 +193,9 @@ class SlacktivityApp(App):
         # Vim-style navigation, mirroring the arrow keys; hidden from the footer.
         Binding("j", "feed_cursor(1)", show=False),
         Binding("k", "feed_cursor(-1)", show=False),
-        Binding("g", "poll_now", "Refresh", show=True),
+        # Refresh and bell are hidden from the footer; reach them via the command palette (ctrl+p).
+        Binding("g", "poll_now", "Refresh", show=False),
+        Binding("b", "toggle_bell", "Bell", show=False),
         Binding("o", "open_message", "Open in Slack", show=True),
         Binding("q", "quit", "Quit", show=True),
     ]
@@ -199,6 +245,9 @@ class SlacktivityApp(App):
             self.dismissed[(m.channel, m.ts)] = m
         self._undo_stack: list[UndoEntry] = []
         self.active: set[str] = {"all_unread"}
+        self.bell_enabled = config.bell
+        # Counts new unread messages ingested during the current poll, to ring once per poll.
+        self._new_unread = 0
         self.show_dismissed = False
         self.visible_order: list[tuple[str, str]] = []
         self._render_sig: tuple | None = None
@@ -326,6 +375,7 @@ class SlacktivityApp(App):
             self.update_status()
             return
 
+        self._new_unread = 0
         entries = (
             counts.get("channels", []) + counts.get("mpims", []) + counts.get("ims", [])
         )
@@ -341,6 +391,14 @@ class SlacktivityApp(App):
 
         self._trim()
         self.refresh_table()
+        if self.bell_enabled and self._new_unread:
+            self._double_bell()
+
+    def _double_bell(self) -> None:
+        """Two quick beeps so a new message is distinguishable from a single error bell."""
+        self.bell()
+        # A short gap keeps terminals from collapsing the pair into one beep.
+        self.set_timer(0.15, self.bell)
 
     async def _sync_channel(self, entry: dict) -> None:
         cid = entry["id"]
@@ -387,7 +445,7 @@ class SlacktivityApp(App):
             f"<@{self.own_id}>" in body
             or any(tag in body for tag in ("<!here", "<!channel", "<!everyone"))
         )
-        self.messages[key] = Message(
+        message = Message(
             channel=cid,
             channel_name=await self._channel_name(cid),
             is_dm=bool(meta.get("is_dm")),
@@ -396,6 +454,11 @@ class SlacktivityApp(App):
             text=await self._render_text(body),
             is_mention=is_mention,
         )
+        self.messages[key] = message
+        # Count new arrivals that show under the active filters (not the startup backfill,
+        # not your own messages) so poll() can ring once.
+        if self._bootstrapped and raw.get("user") != self.own_id and self._is_visible(message):
+            self._new_unread += 1
 
     async def _channel_name(self, cid: str) -> str:
         meta = self.channels.get(cid)
@@ -536,9 +599,11 @@ class SlacktivityApp(App):
             text = escape(f"{key} {label}")
             chips.append(f"[reverse] {text} [/reverse]" if fid in self.active else f"[dim]{text}[/dim]")
         filters = "  ".join(chips)
+        bell = "🔔" if self.bell_enabled else "🔕"
         status.update(
             f"[b]Filters[/b]  {filters}    "
-            f"shown: {len(self.visible_order)}   dismissed: {len(self.dismissed)}   {self.status_extra}"
+            f"shown: {len(self.visible_order)}   dismissed: {len(self.dismissed)}   "
+            f"{bell}   {self.status_extra}"
         )
 
     # ---- actions -------------------------------------------------------
@@ -656,6 +721,14 @@ class SlacktivityApp(App):
 
     async def action_poll_now(self) -> None:
         await self.poll()
+
+    def action_toggle_bell(self) -> None:
+        """Toggle the terminal bell on new messages, persisting the choice to config."""
+        self.bell_enabled = not self.bell_enabled
+        self.config.bell = self.bell_enabled
+        save(self.config.token, self.config.cookie, self.config.watch, self.bell_enabled)
+        self.notify(f"Bell {'on' if self.bell_enabled else 'off'}.")
+        self.update_status()
 
     def action_open_message(self) -> None:
         """Open the selected message in the Slack client via a deep link."""

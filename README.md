@@ -65,8 +65,14 @@ workspace; file it and the lookup can be pointed at the right field.
 | `u` | in the read view, mark the selected message unread (restore it to the feed) |
 | `z` | undo the last mark-read / mark-unread action |
 | `g` | poll now |
+| `b` | toggle the terminal bell on new messages (persists to `config.json`) |
+| `ctrl+p` | open the command palette (refresh, settings, filters, views) |
 | `q` | quit |
 | ↑/↓ | move selection |
+
+The command palette (`ctrl+p`) lists refresh and the toggleable settings — the
+bell, each feed filter, and the read-archive view — so you can search for them
+instead of remembering the key.
 
 Marking read is a local triage layer — it dismisses individual messages from the
 feed so that anything still showing needs your attention. It does **not** touch
@@ -82,12 +88,16 @@ Edit `~/.config/slacktivity/config.json`:
 {
   "token": "xoxc-...",
   "cookie": "xoxd-...",
-  "watch": ["#eng-oncall", "#general", "@jane"]
+  "watch": ["#eng-oncall", "#general", "@jane"],
+  "bell": true
 }
 ```
 
 Entries match channel names (with or without `#`/`@`) or raw channel IDs, and
 are merged into the **Favorites** filter alongside your Slack-starred channels.
+
+Set `"bell": true` (or press `b` in the app) to ring the terminal bell when a
+new unread message arrives. Your own messages and the startup backfill don't ring.
 
 ## How it works
 

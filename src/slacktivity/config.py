@@ -25,6 +25,8 @@ class Config:
     cookie: str
     # Channel names (with or without leading '#'/'@') or IDs to surface under the "Watched" filter.
     watch: list[str] = field(default_factory=list)
+    # Ring the terminal bell when a new unread message arrives.
+    bell: bool = False
 
 
 def load() -> Config:
@@ -36,6 +38,7 @@ def load() -> Config:
     token = os.environ.get("SLACKTIVITY_TOKEN") or data.get("token")
     cookie = os.environ.get("SLACKTIVITY_COOKIE") or data.get("cookie")
     watch = data.get("watch", [])
+    bell = data.get("bell", False)
 
     if not token or not cookie:
         raise SystemExit(
@@ -43,13 +46,13 @@ def load() -> Config:
             "Run `slacktivity auth` to set them up, or set "
             "SLACKTIVITY_TOKEN and SLACKTIVITY_COOKIE."
         )
-    return Config(token=token, cookie=cookie, watch=watch)
+    return Config(token=token, cookie=cookie, watch=watch, bell=bell)
 
 
-def save(token: str, cookie: str, watch: list[str] | None = None) -> Path:
+def save(token: str, cookie: str, watch: list[str] | None = None, bell: bool = False) -> Path:
     """Persist credentials to the config file with owner-only permissions."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    payload = {"token": token, "cookie": cookie, "watch": watch or []}
+    payload = {"token": token, "cookie": cookie, "watch": watch or [], "bell": bell}
     CONFIG_PATH.write_text(json.dumps(payload, indent=2))
     CONFIG_PATH.chmod(0o600)
     return CONFIG_PATH

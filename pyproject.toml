@@ -1,7 +1,7 @@
 [project]
-name = "slacktivity"
-version = "0.1.0"
-description = "Live terminal feed of recent Slack messages with mark-as-read, authed via your browser session token (no org app install)."
+name = "activity"
+version = "0.2.0"
+description = "Live terminal feed of your notifications — Slack messages and Gmail mail — with local mark-as-read triage."
 authors = [
     { name = "Aaron Mandle", email = "879468+amandle@users.noreply.github.com" }
 ]
@@ -12,7 +12,12 @@ dependencies = [
 ]
 
 [project.scripts]
-slacktivity = "slacktivity:main"
+activity = "activity:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
 
 [build-system]
 requires = ["uv_build>=0.11.13,<0.12.0"]

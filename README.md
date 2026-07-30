@@ -40,7 +40,7 @@ Stored in `~/.config/slacktivity/config.json` (mode 600). You can also set
 uv run slacktivity
 ```
 
-### Filters (toggle, union)
+### Filters (cycle, union)
 
 | Key | Filter | Shows |
 |-----|--------|-------|
@@ -48,7 +48,14 @@ uv run slacktivity
 | `2` | Favorites | messages in your Slack-starred channels (plus any `watch` entries in `config.json`) |
 | `3` | DMs + mentions | direct messages and messages that @-mention you |
 
-A message is shown if it matches **any** active filter. `1` starts on.
+Each key cycles its filter through **off → on → ghost → off**:
+
+- **on** — matching messages show normally and can ring the bell.
+- **ghost** — matching messages show greyed out and never ring the bell.
+- **off** — matching messages are hidden.
+
+A message is shown if **any** filter (on or ghost) matches it, and it's greyed
+only when no "on" filter matches. `1` starts on.
 
 Favorites are read from Slack's `client.userBoot` payload (your starred channels)
 at startup. The status bar shows how many were found — if it says `0 favorites`
@@ -59,8 +66,8 @@ workspace; file it and the lookup can be pointed at the right field.
 
 | Key | Action |
 |-----|--------|
-| `r` | mark the selected message read (dismiss it from the feed) |
-| `a` | mark every visible message read — or, in the read view, mark them all unread |
+| `e` | mark the selected message read (dismiss it from the feed) |
+| `E` | mark every visible message read — or, in the read view, mark them all unread |
 | `d` | toggle the **read view** (archive of messages you've marked read) |
 | `u` | in the read view, mark the selected message unread (restore it to the feed) |
 | `z` | undo the last mark-read / mark-unread action |

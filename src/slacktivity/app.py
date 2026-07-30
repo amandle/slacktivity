@@ -54,6 +54,13 @@ FILTERS: dict[str, tuple[str, str]] = {
     "3": ("dm_mentions", "DMs + mentions"),
 }
 
+# Each filter cycles off -> on -> ghost -> off. Ghost shows matching messages
+# greyed out and never rings the bell; on shows them normally and can ring.
+FILTER_OFF = "off"
+FILTER_ON = "on"
+FILTER_GHOST = "ghost"
+FILTER_CYCLE = {FILTER_OFF: FILTER_ON, FILTER_ON: FILTER_GHOST, FILTER_GHOST: FILTER_OFF}
+
 # Slack message markup -> readable text.
 RE_USER = re.compile(r"<@([UW][A-Z0-9]+)(?:\|[^>]+)?>")
 RE_CHANNEL = re.compile(r"<#(C[A-Z0-9]+)(?:\|([^>]+))?>")
@@ -144,11 +151,11 @@ class SettingsCommands(Provider):
             (view_label, "Toggle the read-archive view", app.action_toggle_dismissed),
         ]
         for key, (fid, label) in FILTERS.items():
-            state = "on" if fid in app.active else "off"
+            state = app.filter_state[fid]
             commands.append(
                 (
                     f"Filter: {label} ({state})",
-                    "Toggle this feed filter",
+                    "Cycle this feed filter: off -> on -> ghost",
                     partial(app.action_toggle, key),
                 )
             )
@@ -178,6 +185,7 @@ class SlacktivityApp(App):
     #feed .c-chan { width: 18; }
     #feed .c-user { width: 14; }
     #feed .c-text { width: 1fr; }
+    #feed .ghost { text-style: dim; }
     """
 
     BINDINGS = [
@@ -185,8 +193,8 @@ class SlacktivityApp(App):
         Binding("1", "toggle('1')", "Unread", show=False),
         Binding("2", "toggle('2')", "Favs", show=False),
         Binding("3", "toggle('3')", "DM/@", show=False),
-        Binding("r", "mark_read", "Mark read", show=True),
-        Binding("a", "mark_all", "Mark all read", show=True),
+        Binding("e", "mark_read", "Mark read", show=True),
+        Binding("E", "mark_all", "Mark all read", show=True),
         Binding("d", "toggle_dismissed", "Read view", show=True),
         Binding("u", "unmark", "Mark unread", show=True),
         Binding("z", "undo", "Undo", show=True),
@@ -244,9 +252,10 @@ class SlacktivityApp(App):
             m = self._message_from_record(record)
             self.dismissed[(m.channel, m.ts)] = m
         self._undo_stack: list[UndoEntry] = []
-        self.active: set[str] = {"all_unread"}
+        self.filter_state: dict[str, str] = {fid: FILTER_OFF for fid, _ in FILTERS.values()}
+        self.filter_state["all_unread"] = FILTER_ON
         self.bell_enabled = config.bell
-        # Counts new unread messages ingested during the current poll, to ring once per poll.
+        # Counts new "on"-filter messages ingested during the current poll, to ring once per poll.
         self._new_unread = 0
         self.show_dismissed = False
         self.visible_order: list[tuple[str, str]] = []
@@ -455,9 +464,13 @@ class SlacktivityApp(App):
             is_mention=is_mention,
         )
         self.messages[key] = message
-        # Count new arrivals that show under the active filters (not the startup backfill,
-        # not your own messages) so poll() can ring once.
-        if self._bootstrapped and raw.get("user") != self.own_id and self._is_visible(message):
+        # Count new arrivals shown by an "on" filter (not ghost, not the startup
+        # backfill, not your own messages) so poll() can ring once. Ghost stays silent.
+        if (
+            self._bootstrapped
+            and raw.get("user") != self.own_id
+            and self._visibility(message) == FILTER_ON
+        ):
             self._new_unread += 1
 
     async def _channel_name(self, cid: str) -> str:
@@ -499,60 +512,87 @@ class SlacktivityApp(App):
     def _is_unread(self, m: Message) -> bool:
         return m.ts_float > self.last_read.get(m.channel, 0.0)
 
-    def _is_visible(self, m: Message) -> bool:
-        if (m.channel, m.ts) in self.dismissed:
-            return False
-        if "all_unread" in self.active and self._is_unread(m):
-            return True
-        if "favorites" in self.active and m.channel in self.favorite_ids:
-            return True
-        if "dm_mentions" in self.active and (m.is_dm or m.is_mention):
-            return True
+    def _matches_filter(self, fid: str, m: Message) -> bool:
+        if fid == "all_unread":
+            return self._is_unread(m)
+        if fid == "favorites":
+            return m.channel in self.favorite_ids
+        if fid == "dm_mentions":
+            return m.is_dm or m.is_mention
         return False
+
+    def _visibility(self, m: Message) -> str | None:
+        """Return FILTER_ON, FILTER_GHOST, or None (hidden) under the current filter states.
+
+        A message shown by any "on" filter is FILTER_ON; if only "ghost" filters match
+        it, it's FILTER_GHOST (greyed, silent). Matching no enabled filter hides it.
+        """
+        if (m.channel, m.ts) in self.dismissed:
+            return None
+        matched_ghost = False
+        for fid, state in self.filter_state.items():
+            if state == FILTER_OFF or not self._matches_filter(fid, m):
+                continue
+            if state == FILTER_ON:
+                return FILTER_ON
+            matched_ghost = True
+        return FILTER_GHOST if matched_ghost else None
 
     @staticmethod
     def _truncate(text: str, width: int) -> str:
         text = text or ""
         return text if len(text) <= width else text[: width - 1] + "…"
 
-    def _build_item(self, m: Message, marker: str) -> ListItem:
-        """A row with fixed time/channel/user columns and a wrapping text column."""
+    def _build_item(self, m: Message, marker: str, ghosted: bool = False) -> ListItem:
+        """A row with fixed time/channel/user columns and a wrapping text column.
+
+        Ghosted rows (shown only by a "ghost"-state filter) render dimmed throughout.
+        """
         clock = time.strftime("%m/%d %H:%M", time.localtime(m.ts_float))
         time_col = self._truncate(f"{marker} {clock}", COL_TIME_W - 1)
         chan_col = self._truncate(m.channel_name, COL_CHAN_W - 1)
         user_col = self._truncate(m.author, COL_USER_W - 1)
+        chan_markup = "dim" if ghosted else "b"
+        user_markup = "dim" if ghosted else "cyan"
         # Render user text with markup disabled: Textual's parser opens a tag on
         # any '[', but the escape regex only covers lowercase-led tags, so content
-        # like "[ENG-123=>]" slips through escaping and crashes the parser.
+        # like "[ENG-123=>]" slips through escaping and crashes the parser. The
+        # ghost dim comes from CSS (.ghost) instead, which doesn't need markup.
+        text_classes = "c-text ghost" if ghosted else "c-text"
         if m.text:
-            body = Label(self._truncate(m.text, MAX_BODY_CHARS), classes="c-text", markup=False)
+            body = Label(self._truncate(m.text, MAX_BODY_CHARS), classes=text_classes, markup=False)
         else:
-            body = Label("[dim](no text)[/dim]", classes="c-text")
+            body = Label("[dim](no text)[/dim]", classes=text_classes)
         row = Horizontal(
             Label(f"[dim]{escape(time_col)}[/dim]", classes="c-time"),
-            Label(f"[b]{escape(chan_col)}[/b]", classes="c-chan"),
-            Label(f"[cyan]{escape(user_col)}[/cyan]", classes="c-user"),
+            Label(f"[{chan_markup}]{escape(chan_col)}[/{chan_markup}]", classes="c-chan"),
+            Label(f"[{user_markup}]{escape(user_col)}[/{user_markup}]", classes="c-user"),
             body,
             classes="row",
         )
         return ListItem(row)
 
     def refresh_table(self) -> None:
+        # Each row is (message, marker, ghosted).
         if self.show_dismissed:
-            rows = sorted(self.dismissed.values(), key=lambda m: m.ts_float)[-MAX_ROWS:]
+            ordered = sorted(self.dismissed.values(), key=lambda m: m.ts_float)[-MAX_ROWS:]
+            rows = [(m, "✓", False) for m in ordered]
         else:
-            rows = sorted(
-                (m for m in self.messages.values() if self._is_visible(m)),
-                key=lambda m: m.ts_float,
-            )[-MAX_ROWS:]
-        markers = ["✓" if self.show_dismissed else ("●" if self._is_unread(m) else " ") for m in rows]
+            visible = [
+                (m, state) for m in self.messages.values() if (state := self._visibility(m))
+            ]
+            visible.sort(key=lambda pair: pair[0].ts_float)
+            rows = [
+                (m, "●" if self._is_unread(m) else " ", state == FILTER_GHOST)
+                for m, state in visible[-MAX_ROWS:]
+            ]
 
         # Skip the DOM rebuild when nothing on screen would change — this stops the
         # feed from flickering on the steady-state polls that fetch no new messages.
         signature = (
             self.show_dismissed,
-            frozenset(self.active),
-            tuple((m.channel, m.ts, mk, m.text) for m, mk in zip(rows, markers)),
+            tuple(sorted(self.filter_state.items())),
+            tuple((m.channel, m.ts, mk, ghosted, m.text) for m, mk, ghosted in rows),
         )
         if signature == self._render_sig:
             return
@@ -563,8 +603,8 @@ class SlacktivityApp(App):
         feed.clear()
         self.visible_order = []
         items: list[ListItem] = []
-        for m, marker in zip(rows, markers):
-            items.append(self._build_item(m, marker))
+        for m, marker, ghosted in rows:
+            items.append(self._build_item(m, marker, ghosted))
             self.visible_order.append((m.channel, m.ts))
         feed.extend(items)
         if self.visible_order:
@@ -596,8 +636,14 @@ class SlacktivityApp(App):
             return
         chips = []
         for key, (fid, label) in FILTERS.items():
-            text = escape(f"{key} {label}")
-            chips.append(f"[reverse] {text} [/reverse]" if fid in self.active else f"[dim]{text}[/dim]")
+            state = self.filter_state[fid]
+            if state == FILTER_ON:
+                chip = f"[reverse] {escape(f'{key} {label}')} [/reverse]"
+            elif state == FILTER_GHOST:
+                chip = f"[dim italic] {escape(f'{key} {label} (ghost)')} [/dim italic]"
+            else:
+                chip = f"[dim]{escape(f'{key} {label}')}[/dim]"
+            chips.append(chip)
         filters = "  ".join(chips)
         bell = "🔔" if self.bell_enabled else "🔕"
         status.update(
@@ -609,11 +655,9 @@ class SlacktivityApp(App):
     # ---- actions -------------------------------------------------------
 
     def action_toggle(self, key: str) -> None:
+        """Cycle a filter through off -> on -> ghost -> off."""
         fid = FILTERS[key][0]
-        if fid in self.active:
-            self.active.discard(fid)
-        else:
-            self.active.add(fid)
+        self.filter_state[fid] = FILTER_CYCLE[self.filter_state[fid]]
         self.update_status()  # immediate feedback even if visible rows don't change
         self.refresh_table()
 
